@@ -542,6 +542,21 @@ impl<T> Event<T> {
             0
         }
     }
+
+    /// Test-only: number of listeners currently parked in the `Task` state.
+    #[cfg(all(
+        test,
+        feature = "std",
+        not(feature = "critical-section"),
+        not(target_family = "wasm"),
+        not(loom)
+    ))]
+    fn task_count(&self) -> usize {
+        match self.try_inner() {
+            Some(inner) => inner.list.task_count(),
+            None => 0,
+        }
+    }
 }
 
 impl Event<()> {
@@ -1303,6 +1318,11 @@ impl Task {
     }
 
     fn wake(self) {
+        // Test-only instrumentation: a wake delivered while the listener-list lock is held
+        // forces the woken task to immediately block on the same lock (a wasted wake).
+        #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+        wake_stats::record_wake();
+
         match self {
             Self::Waker(waker) => waker.wake(),
             #[cfg(all(feature = "std", not(target_family = "wasm")))]
@@ -1310,6 +1330,56 @@ impl Task {
                 unparker.unpark();
             }
         }
+    }
+}
+
+/// Test-only counters measuring how many task wakes happen while the internal lock is held.
+///
+/// Wakes emitted under the lock are ineffective: the woken task cannot make progress until the
+/// notifier releases the lock, so it immediately blocks again. The counters are shared between
+/// threads so blocking tests with many waiting threads can measure the wasted-wake ratio.
+#[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+pub(crate) mod wake_stats {
+    use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Number of wakes delivered while the internal lock was held.
+    static WAKES_WHILE_LOCKED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Number of wakes delivered after the internal lock was released.
+    static WAKES_WHILE_UNLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+    // Per-thread flag marking that the current thread holds the internal lock.
+    std::thread_local! {
+        static LOCK_HELD: AtomicBool = const { AtomicBool::new(false) };
+    }
+
+    /// Mark the current thread as holding (or no longer holding) the internal lock.
+    pub(crate) fn set_lock_held(held: bool) {
+        LOCK_HELD.with(|flag| flag.store(held, Ordering::Relaxed));
+    }
+
+    /// Record one wake, attributing it to the locked or unlocked bucket.
+    pub(crate) fn record_wake() {
+        let locked = LOCK_HELD.with(|flag| flag.load(Ordering::Relaxed));
+        if locked {
+            WAKES_WHILE_LOCKED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            WAKES_WHILE_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Reset all counters.
+    pub(crate) fn reset() {
+        WAKES_WHILE_LOCKED.store(0, Ordering::Relaxed);
+        WAKES_WHILE_UNLOCKED.store(0, Ordering::Relaxed);
+    }
+
+    /// Return `(wakes_while_locked, wakes_while_unlocked)`.
+    pub(crate) fn counts() -> (usize, usize) {
+        (
+            WAKES_WHILE_LOCKED.load(Ordering::Relaxed),
+            WAKES_WHILE_UNLOCKED.load(Ordering::Relaxed),
+        )
     }
 }
 

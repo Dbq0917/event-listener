@@ -6,7 +6,10 @@
 use crate::notify::{GenericNotify, Internal, Notification};
 use crate::sync::atomic::Ordering;
 use crate::sync::cell::{Cell, UnsafeCell};
-use crate::{RegisterResult, State, TaskRef};
+use crate::{RegisterResult, State, Task, TaskRef};
+
+use alloc::vec::Vec;
+use small_wake_buffer::SmallWakeBuffer;
 
 #[cfg(feature = "critical-section")]
 use core::cell::RefCell;
@@ -45,6 +48,13 @@ struct Inner<T> {
 
     /// The number of notified listeners.
     notified: usize,
+
+    /// Tasks whose listeners were notified while the lock was held.
+    ///
+    /// Wakers are collected here instead of being invoked immediately so that every wake is
+    /// emitted *after* the lock has been released. Otherwise a woken task would immediately
+    /// block trying to acquire the same lock again, turning the wake into wasted work.
+    pending_wakes: SmallWakeBuffer<Task>,
 }
 
 impl<T> List<T> {
@@ -56,6 +66,7 @@ impl<T> List<T> {
             next: None,
             len: 0,
             notified: 0,
+            pending_wakes: SmallWakeBuffer::new(),
         };
 
         #[cfg(feature = "critical-section")]
@@ -92,6 +103,31 @@ impl<T> List<T> {
         self.0.try_with(|list| list.len)
     }
 
+    /// Count listeners whose state is `Task`, i.e. that are parked waiting for a wake.
+    #[cfg(all(
+        test,
+        feature = "std",
+        not(feature = "critical-section"),
+        not(target_family = "wasm"),
+        not(loom)
+    ))]
+    pub(crate) fn task_count(&self) -> usize {
+        let inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0;
+        let mut cursor = inner.head;
+        while let Some(link) = cursor {
+            // SAFETY: the list lock is held, so every link is stable and readable.
+            let link_ref = unsafe { link.as_ref() };
+            // SAFETY: the list lock is held, so the cell's contents are not mutated concurrently.
+            let state = unsafe { &*link_ref.state.as_ptr() };
+            if matches!(state, State::Task(_)) {
+                count += 1;
+            }
+            cursor = link_ref.next.get();
+        }
+        count
+    }
+
     /// Get the total number of listeners with blocking.
     #[cfg(all(feature = "std", not(feature = "critical-section")))]
     pub(crate) fn total_listeners(&self) -> usize {
@@ -112,6 +148,8 @@ impl<T> crate::Inner<T> {
         struct ListLock<'a, 'b, T> {
             lock: crate::sync::MutexGuard<'a, Inner<T>>,
             inner: &'b crate::Inner<T>,
+            #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+            _held: LockHeldGuard,
         }
 
         impl<T> Deref for ListLock<'_, '_, T> {
@@ -137,8 +175,23 @@ impl<T> crate::Inner<T> {
         let mut list = ListLock {
             inner: self,
             lock: self.list.0.lock().unwrap_or_else(|e| e.into_inner()),
+            #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+            _held: LockHeldGuard::new(),
         };
-        f(&mut list)
+        let result = f(&mut list);
+
+        // Take the wakers out while still holding the lock, then drop the guard so that the
+        // wakes happen with no lock held. This stops woken tasks from immediately blocking on
+        // the very lock they were notified under.
+        if !list.pending_wakes.is_empty() {
+            let pending_wakes = list.pending_wakes.drain().collect::<Vec<_>>();
+            drop(list);
+            for task in pending_wakes {
+                task.wake();
+            }
+        }
+
+        result
     }
 
     #[cfg(any(not(feature = "std"), feature = "critical-section"))]
@@ -146,6 +199,8 @@ impl<T> crate::Inner<T> {
         struct ListWrapper<'a, T> {
             inner: &'a crate::Inner<T>,
             list: &'a mut Inner<T>,
+            #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+            _held: LockHeldGuard,
         }
 
         impl<T> Drop for ListWrapper<'_, T> {
@@ -160,9 +215,20 @@ impl<T> crate::Inner<T> {
             let wrapper = ListWrapper {
                 inner: self,
                 list: &mut *list,
+                #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+                _held: LockHeldGuard::new(),
             };
 
-            f(wrapper.list)
+            let result = f(wrapper.list);
+            if !wrapper.list.pending_wakes.is_empty() {
+                let pending_wakes = wrapper.list.pending_wakes.drain().collect::<Vec<_>>();
+                drop(wrapper);
+                drop(list);
+                for task in pending_wakes {
+                    task.wake();
+                }
+            }
+            result
         });
 
         #[cfg(not(feature = "critical-section"))]
@@ -170,9 +236,19 @@ impl<T> crate::Inner<T> {
             let wrapper = ListWrapper {
                 inner: self,
                 list: &mut *list,
+                #[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+                _held: LockHeldGuard::new(),
             };
 
-            f(wrapper.list)
+            let result = f(wrapper.list);
+            if !wrapper.list.pending_wakes.is_empty() {
+                let pending_wakes = wrapper.list.pending_wakes.drain().collect::<Vec<_>>();
+                drop(wrapper);
+                for task in pending_wakes {
+                    task.wake();
+                }
+            }
+            result
         })
     }
 
@@ -374,7 +450,8 @@ impl<T> Inner<T> {
                         additional: is_additional,
                         tag,
                     }) {
-                        task.wake();
+                        // Defer the wake until the lock is released (see `with_inner`).
+                        self.pending_wakes.push(task);
                     }
 
                     // Bump the notified count.
@@ -396,6 +473,98 @@ fn update_notified<T>(slot: &crate::sync::atomic::AtomicUsize, list: &Inner<T>) 
     };
 
     slot.store(notified, Ordering::Release);
+}
+
+/// A buffer of tasks to wake that avoids heap allocation for small batches.
+///
+/// Notifications of a handful of listeners (the common `notify(1)` case) are stored inline.
+/// Only batches larger than [`SmallWakeBuffer::INLINE_CAPACITY`] spill over to a heap-allocated
+/// [`Vec`], keeping the hot path allocation-free.
+mod small_wake_buffer {
+    use alloc::vec::Vec;
+    use core::mem::MaybeUninit;
+
+    /// Number of tasks that can be buffered without a heap allocation.
+    const INLINE_CAPACITY: usize = 32;
+
+    pub(super) struct SmallWakeBuffer<T> {
+        /// Inline storage used until `len` reaches `INLINE_CAPACITY`.
+        inline: [MaybeUninit<T>; INLINE_CAPACITY],
+
+        /// Heap storage used once the inline capacity is exhausted.
+        spilled: Vec<T>,
+
+        /// Number of tasks currently held in the inline storage.
+        len: usize,
+    }
+
+    impl<T> SmallWakeBuffer<T> {
+        /// Create an empty buffer.
+        pub(super) const fn new() -> Self {
+            Self {
+                inline: unsafe { MaybeUninit::uninit().assume_init() },
+                spilled: Vec::new(),
+                len: 0,
+            }
+        }
+
+        /// Whether the buffer currently holds no tasks.
+        pub(super) fn is_empty(&self) -> bool {
+            self.len == 0 && self.spilled.is_empty()
+        }
+
+        /// Append a task to the buffer.
+        pub(super) fn push(&mut self, value: T) {
+            if self.len < INLINE_CAPACITY {
+                self.inline[self.len].write(value);
+                self.len += 1;
+            } else {
+                self.spilled.push(value);
+            }
+        }
+
+        /// Drain all tasks, leaving the buffer empty.
+        pub(super) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+            let len = self.len;
+            self.len = 0;
+            let inline = &mut self.inline[..len];
+
+            // SAFETY: the first `len` slots were initialized by `push` and are read once here.
+            let inline_iter = unsafe { inline.iter_mut().map(|slot| slot.assume_init_read()) };
+
+            inline_iter.chain(self.spilled.drain(..))
+        }
+    }
+
+    impl<T> Drop for SmallWakeBuffer<T> {
+        fn drop(&mut self) {
+            for slot in self.inline[..self.len].iter_mut() {
+                // SAFETY: the first `len` slots were initialized by `push`.
+                unsafe { slot.assume_init_drop() };
+            }
+        }
+    }
+}
+
+/// Test-only guard marking that the current thread holds the internal listener-list lock.
+#[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+struct LockHeldGuard {
+    _private: (),
+}
+
+#[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+impl LockHeldGuard {
+    fn new() -> Self {
+        crate::wake_stats::set_lock_held(true);
+        LockHeldGuard { _private: () }
+    }
+}
+
+#[cfg(all(test, not(feature = "critical-section"), not(target_family = "wasm")))]
+impl Drop for LockHeldGuard {
+    fn drop(&mut self) {
+        crate::wake_stats::set_lock_held(false);
+    }
 }
 
 pub(crate) struct Listener<T> {
@@ -549,5 +718,67 @@ mod tests {
         // Remove the rest.
         inner.remove(listen1, true);
         inner.remove(listen2, true);
+    }
+
+    /// With hundreds of blocked waiters, assert that no wake is delivered while the internal
+    /// lock is held and report the wasted-wake ratio.
+    #[cfg(all(
+        feature = "std",
+        not(feature = "critical-section"),
+        not(target_family = "wasm"),
+        not(loom)
+    ))]
+    #[test]
+    fn no_wakes_while_locked() {
+        use crate::wake_stats;
+        use crate::Listener;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const WAITERS: usize = 200;
+
+        wake_stats::reset();
+
+        let event = std::sync::Arc::new(crate::Event::new());
+        let ready = std::sync::Arc::new(Barrier::new(WAITERS + 1));
+
+        let mut handles = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let event = event.clone();
+            let ready = ready.clone();
+            handles.push(thread::spawn(move || {
+                let listener = event.listen();
+                ready.wait();
+                listener.wait();
+            }));
+        }
+
+        // Wait until every listener is registered and actually parked.
+        ready.wait();
+        while event.task_count() != WAITERS {
+            thread::yield_now();
+        }
+
+        assert_eq!(event.notify(WAITERS), WAITERS);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (wakes_while_locked, wakes_while_unlocked) = wake_stats::counts();
+        let total = wakes_while_locked + wakes_while_unlocked;
+
+        assert_eq!(total, WAITERS, "each parked task is woken exactly once");
+        assert_eq!(
+            wakes_while_locked, 0,
+            "no wake may be delivered while the internal lock is held"
+        );
+        assert_eq!(wakes_while_unlocked, WAITERS);
+
+        let wasted_ratio = wakes_while_locked as f64 / total as f64;
+        eprintln!(
+            "waiters={WAITERS} total_wakes={total} wakes_while_locked={wakes_while_locked} \
+             wakes_while_unlocked={wakes_while_unlocked} wasted_wake_ratio={wasted_ratio:.4}"
+        );
     }
 }

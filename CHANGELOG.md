@@ -1,3 +1,12 @@
+# Unreleased
+
+- Emit task wakes after releasing the internal listener-list lock instead of while
+  holding it. Waking under the lock forced every woken task to immediately block on
+  the same lock, producing a thundering herd that wasted CPU, especially with hundreds
+  of waiting listeners. Wakers are collected in an allocation-free inline buffer and
+  invoked once the lock is dropped, preserving notification counts, FIFO ordering and
+  the no-lost-wakeup guarantees.
+
 # Version 5.4.2
 
 - Add spinlock implementation to intrusive.rs.
